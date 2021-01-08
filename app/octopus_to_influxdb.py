@@ -5,7 +5,10 @@ from urllib import parse
 
 import click
 import maya
+import logging
 import requests
+import schedule
+import time
 from influxdb import InfluxDBClient
 
 
@@ -74,15 +77,19 @@ def store_series(connection, series, metrics, rate_data, dryrun):
         conversion_factor = rate_data.get('conversion_factor', None)
         if conversion_factor:
             consumption *= conversion_factor
+        fields = {
+          'consumption': consumption,
+        }
+        
         rate = active_rate_field(measurement)
         rate_cost = rate_data[rate]
         cost = consumption * rate_cost
         standing_charge = rate_data['standing_charge'] / 48  # 30 minute reads
-        fields = {
-            'consumption': consumption,
+        fields.update({
             'cost': cost,
             'total_cost': cost + standing_charge,
-        }
+        })
+        
         if agile_data:
             agile_standing_charge = rate_data['agile_standing_charge'] / 48
             agile_unit_rate = agile_rates.get(
@@ -128,10 +135,34 @@ def store_series(connection, series, metrics, rate_data, dryrun):
     measurements += agile_rates_only
 
     if dryrun:
-        print("\n".join(f"would write {measurement}" for measurement in measurements))
+        logging.info("DRYRUN - didn't write to database, set logging to DEBUG for details")
+        logging.debug("\n".join(f"{measurement}" for measurement in measurements))
     else:
         connection.write_points(measurements)
 
+def run(api_key, e_url, g_url, from_iso, to_iso, agile_url, rate_data, influx, dryrun, include_gas):
+    logging.info('Retrieving electricity data for %s until %s' % (from_iso, to_iso))
+    e_consumption = retrieve_paginated_data(
+        api_key, e_url, from_iso, to_iso
+    )
+    logging.info('%s readings.' % len(e_consumption))
+    
+    logging.info('Retrieving Agile rates for %s until %s' % (from_iso, to_iso))
+    rate_data['electricity']['agile_unit_rates'] = retrieve_paginated_data(
+        api_key, agile_url, from_iso, to_iso
+    )
+    logging.info('%s rates' % len(rate_data["electricity"]["agile_unit_rates"]))
+    
+    store_series(influx, 'electricity', e_consumption, rate_data['electricity'], dryrun)
+
+    if include_gas:
+        logging.info('Retrieving gas data for %s until %s' % (from_iso, to_iso))
+        g_consumption = retrieve_paginated_data(
+            api_key, g_url, from_iso, to_iso
+        )
+        logging.info('%s readings.' % len(g_consumption))
+
+        store_series(influx, 'gas', g_consumption, rate_data['gas'], dryrun)
 
 @click.command()
 @click.option(
@@ -146,6 +177,16 @@ def cmd(config_file, from_date, to_date, dryrun):
 
     config = ConfigParser()
     config.read(config_file)
+    
+    get_loglevel = config.get('octopus', 'loglevel', fallback="info")
+    if get_loglevel.lower() == "info":
+        loglevel = logging.INFO
+    elif get_loglevel.lower() == "error":
+        loglevel = logging.ERROR
+    elif get_loglevel.lower() == "debug":
+        loglevel = logging.DEBUG
+    
+    logging.basicConfig(level=loglevel, format='%(asctime)s %(levelname)s %(message)s')
 
     include_gas = "gas" in config
 
@@ -181,6 +222,8 @@ def cmd(config_file, from_date, to_date, dryrun):
                 f'{g_mpan}/meters/{g_serial}/consumption/'
 
     timezone = config.get('electricity', 'unit_rate_low_zone', fallback=None)
+    
+    elec_product = config.get('electricity', 'elec_product', fallback="both")
 
     rate_data = {
         'electricity': {
@@ -220,35 +263,13 @@ def cmd(config_file, from_date, to_date, dryrun):
     from_iso = maya.when(from_date, timezone=timezone).iso8601()
     to_iso = maya.when(to_date, timezone=timezone).iso8601()
 
-    click.echo(
-        f'Retrieving electricity data for {from_iso} until {to_iso}...',
-        nl=False
-    )
-    e_consumption = retrieve_paginated_data(
-        api_key, e_url, from_iso, to_iso
-    )
-    click.echo(f' {len(e_consumption)} readings.')
-    click.echo(
-        f'Retrieving Agile rates for {from_iso} until {to_iso}...',
-        nl=False
-    )
-    rate_data['electricity']['agile_unit_rates'] = retrieve_paginated_data(
-        api_key, agile_url, from_iso, to_iso
-    )
-    click.echo(f' {len(rate_data["electricity"]["agile_unit_rates"])} rates.')
-    store_series(influx, 'electricity', e_consumption, rate_data['electricity'], dryrun)
-
-    if include_gas:
-        click.echo(
-            f'Retrieving gas data for {from_iso} until {to_iso}...',
-            nl=False
-        )
-        g_consumption = retrieve_paginated_data(
-            api_key, g_url, from_iso, to_iso
-        )
-        click.echo(f' {len(g_consumption)} readings.')
-        store_series(influx, 'gas', g_consumption, rate_data['gas'], dryrun)
-
+    args = (api_key, e_url, g_url, from_iso, to_iso, agile_url, rate_data, influx, dryrun, include_gas)
+    schedule.every().hour.at(':32').do(run, *args).run()
+    next_run = schedule.next_run().strftime('%d/%m/%Y %H:%M:%S')
+    logging.info("Scheduled for hourly run, next run is %s " % next_run)
+    while True:
+        schedule.run_pending()
+        time.sleep(1)
 
 if __name__ == '__main__':
     cmd()
